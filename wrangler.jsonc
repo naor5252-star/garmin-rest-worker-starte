@@ -13,7 +13,7 @@
   "kv_namespaces": [
     {
       "binding": "GARMIN_KV",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+      "id": e486c282401a46ddba1a954466033707
     }
   ],
   "observability": {
