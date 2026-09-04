@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "garmin-rest-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "TIMEZONE": "Asia/Jerusalem"
+  },
+  "secrets": {
+    "required": ["API_TOKEN", "ADMIN_TOKEN"]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "GARMIN_KV",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

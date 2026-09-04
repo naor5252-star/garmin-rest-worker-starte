@@ -1,0 +1,20 @@
+{
+  "name": "garmin-rest-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-types": "wrangler types"
+  },
+  "dependencies": {
+    "@dofek/garmin-connect": "^0.1.34"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260904.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.129.0"
+  }
+}
