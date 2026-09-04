@@ -390,6 +390,151 @@ function summarizeRunsForDate(
   };
 }
 
+
+function compactTrainingReadinessEntry(r: any): Record<string, unknown> | null {
+  if (!r) return null;
+
+  return {
+    score: r.score ?? null,
+    level: r.level ?? null,
+    feedback: r.feedbackShort ?? null,
+    recoveryTimeMinutes: r.recoveryTime ?? null,
+    acuteLoad: r.acuteLoad ?? null,
+    hrvWeeklyAverage: r.hrvWeeklyAverage ?? null,
+    factors: {
+      sleep: r.sleepScoreFactorFeedback ?? null,
+      recoveryTime: r.recoveryTimeFactorFeedback ?? null,
+      acuteChronicWorkload: r.acwrFactorFeedback ?? null,
+      stressHistory: r.stressHistoryFactorFeedback ?? null,
+      hrv: r.hrvFactorFeedback ?? null,
+      sleepHistory: r.sleepHistoryFactorFeedback ?? null,
+    },
+    context: r.inputContext ?? null,
+    timestampLocal: r.timestampLocal ?? null,
+  };
+}
+
+function compactTrainingReadinessHistory(
+  readiness: any,
+): Record<string, unknown> | { error: string } | null {
+  if (!readiness) return null;
+  if (readiness.error) return readiness;
+
+  const entries = Array.isArray(readiness) ? readiness : [readiness];
+  if (entries.length === 0) return null;
+
+  const sorted = [...entries].sort((a: any, b: any) => {
+    const aTime = Date.parse(a?.timestamp ?? a?.timestampLocal ?? "") || 0;
+    const bTime = Date.parse(b?.timestamp ?? b?.timestampLocal ?? "") || 0;
+    return bTime - aTime;
+  });
+
+  const morningRaw =
+    sorted.find(
+      (entry: any) => entry?.inputContext === "AFTER_WAKEUP_RESET",
+    ) ?? null;
+
+  const latestRaw = sorted[0] ?? null;
+
+  return {
+    morning: compactTrainingReadinessEntry(morningRaw),
+    latest: compactTrainingReadinessEntry(latestRaw),
+  };
+}
+
+function numericValues(values: unknown[]): number[] {
+  return values.filter(
+    (value: unknown): value is number =>
+      typeof value === "number" && Number.isFinite(value),
+  );
+}
+
+function average(values: unknown[], digits = 1): number | null {
+  const numbers = numericValues(values);
+  if (numbers.length === 0) return null;
+  return round(
+    numbers.reduce((sum, value) => sum + value, 0) / numbers.length,
+    digits,
+  );
+}
+
+function buildCoachTrends(history: Array<Record<string, unknown>>): Record<string, unknown> {
+  const days = history as any[];
+
+  const runCount = days.reduce(
+    (sum: number, day: any) => sum + (day?.runs?.count ?? 0),
+    0,
+  );
+
+  const weeklyDistanceKm = days.reduce(
+    (sum: number, day: any) => sum + (day?.runs?.totalDistanceKm ?? 0),
+    0,
+  );
+
+  const weeklyTrainingLoad = days.reduce(
+    (sum: number, day: any) => sum + (day?.runs?.totalTrainingLoad ?? 0),
+    0,
+  );
+
+  const sleepSeconds = days.map(
+    (day: any) => day?.recovery?.sleep?.durationSeconds,
+  );
+
+  const sleepScores = days.map(
+    (day: any) => day?.recovery?.sleep?.sleepScore,
+  );
+
+  const hrvValues = days.map(
+    (day: any) => day?.recovery?.hrv?.lastNightAvg,
+  );
+
+  const restingHrValues = days.map(
+    (day: any) => day?.recovery?.daily?.restingHeartRate,
+  );
+
+  const bodyBatteryWakeValues = days.map(
+    (day: any) => day?.recovery?.daily?.bodyBattery?.atWake,
+  );
+
+  const morningReadinessValues = days.map(
+    (day: any) => day?.recovery?.trainingReadiness?.morning?.score,
+  );
+
+  const latestReadinessValues = days.map(
+    (day: any) => day?.recovery?.trainingReadiness?.latest?.score,
+  );
+
+  const avgSleepSeconds = average(sleepSeconds, 0);
+
+  return {
+    runCount,
+    weeklyDistanceKm: round(weeklyDistanceKm, 2),
+    weeklyTrainingLoad: round(weeklyTrainingLoad, 1),
+
+    avgSleepHours:
+      typeof avgSleepSeconds === "number"
+        ? round(avgSleepSeconds / 3600, 2)
+        : null,
+    avgSleepScore: average(sleepScores, 1),
+
+    avgHrvLastNight: average(hrvValues, 1),
+    avgRestingHeartRate: average(restingHrValues, 1),
+    avgBodyBatteryAtWake: average(bodyBatteryWakeValues, 1),
+
+    avgMorningTrainingReadiness: average(morningReadinessValues, 1),
+    avgLatestTrainingReadiness: average(latestReadinessValues, 1),
+
+    dataCompleteness: {
+      days: days.length,
+      sleepDays: numericValues(sleepSeconds).length,
+      hrvDays: numericValues(hrvValues).length,
+      restingHrDays: numericValues(restingHrValues).length,
+      bodyBatteryWakeDays: numericValues(bodyBatteryWakeValues).length,
+      morningReadinessDays: numericValues(morningReadinessValues).length,
+    },
+  };
+}
+
 function compactHistoryRecovery(
   summary: unknown,
   sleep: unknown,
@@ -399,7 +544,7 @@ function compactHistoryRecovery(
   const daily = compactDailySummary(summary);
   const compactedSleep = compactSleep(sleep);
   const compactedHrv = compactHrv(hrv);
-  const compactedReadiness = compactTrainingReadiness(readiness);
+  const compactedReadiness = compactTrainingReadinessHistory(readiness);
 
   return {
     daily,
@@ -709,7 +854,7 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
 
       for (let offset = days - 1; offset >= 0; offset--) {
         const date = shiftIsoDate(endDate, -offset);
-        const cacheKey = `coach:history:v1:${date}`;
+        const cacheKey = `coach:history:v2:${date}`;
 
         let recovery =
           await env.GARMIN_KV.get<Record<string, unknown>>(cacheKey, "json");
@@ -757,7 +902,9 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
 
       return {
         history,
+        trends: buildCoachTrends(history),
         cache: {
+          schemaVersion: 2,
           cachedDays,
           fetchedDays,
         },
