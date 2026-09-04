@@ -16,6 +16,11 @@ interface Env {
 
 const TOKEN_KEY = "garmin:tokens";
 
+// Cloudflare Workers native fetch must be invoked with the correct receiver.
+// Wrapping it prevents "Illegal invocation" when a library stores fetch as a method.
+const cfFetch: typeof globalThis.fetch = (input, init) =>
+  globalThis.fetch(input, init);
+
 type JsonValue =
   | null
   | boolean
@@ -76,7 +81,11 @@ async function loadClient(env: Env): Promise<GarminConnectClient> {
     );
   }
 
-  const client = await GarminConnectClient.fromTokens(stored);
+  const client = await GarminConnectClient.fromTokens(
+    stored,
+    "garmin.com",
+    cfFetch,
+  );
   await persistTokens(env, client);
   return client;
 }
@@ -131,6 +140,8 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     const { client, tokens } = await GarminConnectClient.signIn(
       body.email,
       body.password,
+      "garmin.com",
+      cfFetch,
     );
 
     const tokensToStore = client.getTokens() ?? tokens;
@@ -146,7 +157,11 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
 
   if (url.pathname === "/admin/tokens" && request.method === "PUT") {
     const body = (await request.json()) as GarminTokens;
-    const client = await GarminConnectClient.fromTokens(body);
+    const client = await GarminConnectClient.fromTokens(
+      body,
+      "garmin.com",
+      cfFetch,
+    );
 
     // Validate that the tokens can actually access Garmin before persisting.
     await client.getUserSettings();
