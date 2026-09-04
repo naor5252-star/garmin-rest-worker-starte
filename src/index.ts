@@ -161,6 +161,164 @@ function compactRun(activity: any): Record<string, unknown> | null {
   };
 }
 
+
+function compactDailySummary(summary: any): Record<string, unknown> | { error: string } | null {
+  if (!summary) return null;
+  if (summary.error) return summary;
+
+  return {
+    steps: summary.totalSteps ?? null,
+    distanceMeters: summary.totalDistanceMeters ?? null,
+    activeKilocalories: summary.activeKilocalories ?? null,
+    restingHeartRate: summary.restingHeartRate ?? null,
+    sevenDayAvgRestingHeartRate: summary.lastSevenDaysAvgRestingHeartRate ?? null,
+    averageStress: summary.averageStressLevel ?? null,
+    maxStress: summary.maxStressLevel ?? null,
+    intensityMinutes: {
+      moderate: summary.moderateIntensityMinutes ?? null,
+      vigorous: summary.vigorousIntensityMinutes ?? null,
+    },
+    bodyBattery: {
+      atWake: summary.bodyBatteryAtWakeTime ?? null,
+      current: summary.bodyBatteryMostRecentValue ?? null,
+      highest: summary.bodyBatteryHighestValue ?? null,
+      lowest: summary.bodyBatteryLowestValue ?? null,
+      charged: summary.bodyBatteryChargedValue ?? null,
+      drained: summary.bodyBatteryDrainedValue ?? null,
+      duringSleep: summary.bodyBatteryDuringSleep ?? null,
+    },
+    spo2: {
+      average: summary.averageSpo2 ?? null,
+      lowest: summary.lowestSpo2 ?? null,
+      latest: summary.latestSpo2 ?? null,
+    },
+    respiration: {
+      wakingAverage: summary.avgWakingRespirationValue ?? null,
+      highest: summary.highestRespirationValue ?? null,
+      lowest: summary.lowestRespirationValue ?? null,
+      latest: summary.latestRespirationValue ?? null,
+    },
+  };
+}
+
+function compactSleep(sleep: any): Record<string, unknown> | { error: string } | null {
+  if (!sleep) return null;
+  if (sleep.error) return sleep;
+
+  const d = sleep.dailySleepDTO ?? {};
+  const scores = d.sleepScores ?? {};
+
+  return {
+    durationSeconds: d.sleepTimeSeconds ?? null,
+    napSeconds: d.napTimeSeconds ?? null,
+    deepSeconds: d.deepSleepSeconds ?? null,
+    lightSeconds: d.lightSleepSeconds ?? null,
+    remSeconds: d.remSleepSeconds ?? null,
+    awakeSeconds: d.awakeSleepSeconds ?? null,
+    awakenings: d.awakeCount ?? null,
+    restlessMoments: sleep.restlessMomentsCount ?? null,
+    sleepScore: scores.overall?.value ?? null,
+    sleepScoreQualifier: scores.overall?.qualifierKey ?? null,
+    avgSleepStress: d.avgSleepStress ?? null,
+    avgHeartRate: d.avgHeartRate ?? null,
+    avgSpO2: d.averageSpO2Value ?? null,
+    lowestSpO2: d.lowestSpO2Value ?? null,
+    avgRespiration: d.averageRespirationValue ?? null,
+    breathingDisruptionSeverity: d.breathingDisruptionSeverity ?? null,
+    sleepNeedMinutes: d.sleepNeed?.actual ?? null,
+    nextSleepNeedMinutes: d.nextSleepNeed?.actual ?? null,
+  };
+}
+
+function compactHrv(hrv: any): Record<string, unknown> | { error: string } | null {
+  if (!hrv) return null;
+  if (hrv.error) return hrv;
+
+  const s = hrv.hrvSummary ?? {};
+
+  return {
+    status: s.status ?? null,
+    lastNightAvg: s.lastNightAvg ?? null,
+    weeklyAvg: s.weeklyAvg ?? null,
+    lastNight5MinHigh: s.lastNight5MinHigh ?? null,
+    baseline: {
+      lowUpper: s.baseline?.lowUpper ?? null,
+      balancedLow: s.baseline?.balancedLow ?? null,
+      balancedUpper: s.baseline?.balancedUpper ?? null,
+    },
+  };
+}
+
+function compactTrainingReadiness(readiness: any): Record<string, unknown> | { error: string } | null {
+  if (!readiness) return null;
+  if (readiness.error) return readiness;
+
+  const r = Array.isArray(readiness) ? readiness[0] : readiness;
+  if (!r) return null;
+
+  return {
+    score: r.score ?? null,
+    level: r.level ?? null,
+    feedback: r.feedbackShort ?? null,
+    recoveryTimeMinutes: r.recoveryTime ?? null,
+    acuteLoad: r.acuteLoad ?? null,
+    hrvWeeklyAverage: r.hrvWeeklyAverage ?? null,
+    factors: {
+      sleep: r.sleepScoreFactorFeedback ?? null,
+      recoveryTime: r.recoveryTimeFactorFeedback ?? null,
+      acuteChronicWorkload: r.acwrFactorFeedback ?? null,
+      stressHistory: r.stressHistoryFactorFeedback ?? null,
+      hrv: r.hrvFactorFeedback ?? null,
+      sleepHistory: r.sleepHistoryFactorFeedback ?? null,
+    },
+    context: r.inputContext ?? null,
+  };
+}
+
+function compactTrainingStatus(status: any): Record<string, unknown> | { error: string } | null {
+  if (!status) return null;
+  if (status.error) return status;
+
+  const latestMap = status.mostRecentTrainingStatus?.latestTrainingStatusData ?? {};
+  const latest = Object.values(latestMap)[0] as any;
+
+  const balanceMap =
+    status.mostRecentTrainingLoadBalance?.metricsTrainingLoadBalanceDTOMap ?? {};
+  const balance = Object.values(balanceMap)[0] as any;
+
+  return {
+    statusCode: latest?.trainingStatus ?? null,
+    feedback: latest?.trainingStatusFeedbackPhrase ?? null,
+    fitnessTrend: latest?.fitnessTrend ?? null,
+    sport: latest?.sport ?? null,
+    acuteLoad: {
+      value: latest?.acuteTrainingLoadDTO?.dailyTrainingLoadAcute ?? null,
+      chronic: latest?.acuteTrainingLoadDTO?.dailyTrainingLoadChronic ?? null,
+      ratio: latest?.acuteTrainingLoadDTO?.dailyAcuteChronicWorkloadRatio ?? null,
+      status: latest?.acuteTrainingLoadDTO?.acwrStatus ?? null,
+    },
+    loadBalance: {
+      aerobicLow: balance?.monthlyLoadAerobicLow ?? null,
+      aerobicHigh: balance?.monthlyLoadAerobicHigh ?? null,
+      anaerobic: balance?.monthlyLoadAnaerobic ?? null,
+      feedback: balance?.trainingBalanceFeedbackPhrase ?? null,
+    },
+  };
+}
+
+function compactVo2Max(vo2: any): Record<string, unknown> | { error: string } | null {
+  if (!vo2) return null;
+  if (vo2.error) return vo2;
+
+  const v = Array.isArray(vo2) ? vo2[0] : vo2;
+  const generic = v?.generic ?? null;
+
+  return {
+    value: generic?.vo2MaxValue ?? null,
+    precise: generic?.vo2MaxPreciseValue ?? null,
+  };
+}
+
 function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
   const parsed = raw ? Number.parseInt(raw, 10) : fallback;
   if (!Number.isFinite(parsed)) return fallback;
@@ -388,7 +546,6 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
         client.getDailySummary(date),
         client.getSleepData(date),
         client.getHrvSummary(date),
-        client.getBodyBatteryDaily(date),
         client.getTrainingReadiness(date),
         client.getTrainingStatus(date),
         client.getVo2Max(date, date),
@@ -410,16 +567,22 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
         latestRun = activitiesResult;
       }
 
+      const summary = settled(results[1]);
+      const sleep = settled(results[2]);
+      const hrv = settled(results[3]);
+      const readiness = settled(results[4]);
+      const trainingStatus = settled(results[5]);
+      const vo2Max = settled(results[6]);
+
       return {
         latestRun,
         recovery: {
-          summary: settled(results[1]),
-          sleep: settled(results[2]),
-          hrv: settled(results[3]),
-          bodyBattery: settled(results[4]),
-          trainingReadiness: settled(results[5]),
-          trainingStatus: settled(results[6]),
-          vo2Max: settled(results[7]),
+          daily: compactDailySummary(summary),
+          sleep: compactSleep(sleep),
+          hrv: compactHrv(hrv),
+          trainingReadiness: compactTrainingReadiness(readiness),
+          trainingStatus: compactTrainingStatus(trainingStatus),
+          vo2Max: compactVo2Max(vo2Max),
         },
       };
     });
@@ -430,6 +593,7 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
         activityGpsIncluded: false,
         profileIncluded: false,
         userRolesIncluded: false,
+        deviceIdentifiersIncluded: false,
       },
       ...data,
     });
