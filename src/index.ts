@@ -67,6 +67,100 @@ function getDate(url: URL, env: Env): string {
   return url.searchParams.get("date") || todayInTimezone(env.TIMEZONE || "UTC");
 }
 
+function round(value: unknown, digits = 0): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function compactRun(activity: any): Record<string, unknown> | null {
+  if (!activity) return null;
+
+  const distanceMeters =
+    typeof activity.distance === "number" ? activity.distance : null;
+  const durationSeconds =
+    typeof activity.duration === "number" ? activity.duration : null;
+
+  const paceSecPerKm =
+    distanceMeters && durationSeconds
+      ? durationSeconds / (distanceMeters / 1000)
+      : null;
+
+  return {
+    id: activity.activityId ?? null,
+    name: activity.activityName ?? null,
+    activityType: activity.activityType?.typeKey ?? null,
+    startTimeLocal: activity.startTimeLocal ?? null,
+
+    distanceKm: distanceMeters ? round(distanceMeters / 1000, 2) : null,
+    durationSeconds: durationSeconds ? round(durationSeconds, 1) : null,
+    movingDurationSeconds:
+      typeof activity.movingDuration === "number"
+        ? round(activity.movingDuration, 1)
+        : null,
+    paceSecPerKm: paceSecPerKm ? round(paceSecPerKm, 1) : null,
+
+    elevationGainM: round(activity.elevationGain, 0),
+    elevationLossM: round(activity.elevationLoss, 0),
+
+    calories: round(activity.calories, 0),
+
+    avgHr: round(activity.averageHR, 0),
+    maxHr: round(activity.maxHR, 0),
+
+    avgCadenceSpm: round(
+      activity.averageRunningCadenceInStepsPerMinute,
+      1,
+    ),
+    maxCadenceSpm: round(
+      activity.maxRunningCadenceInStepsPerMinute,
+      0,
+    ),
+
+    avgPowerW: round(activity.avgPower, 0),
+    maxPowerW: round(activity.maxPower, 0),
+    normalizedPowerW: round(activity.normPower, 0),
+
+    vo2Max: round(activity.vO2MaxValue, 1),
+
+    aerobicTrainingEffect: round(activity.aerobicTrainingEffect, 1),
+    anaerobicTrainingEffect: round(activity.anaerobicTrainingEffect, 1),
+    trainingEffectLabel: activity.trainingEffectLabel ?? null,
+    trainingLoad: round(activity.activityTrainingLoad, 1),
+
+    bodyBatteryImpact: round(activity.differenceBodyBattery, 0),
+
+    runningDynamics: {
+      verticalOscillationCm: round(activity.avgVerticalOscillation, 2),
+      groundContactTimeMs: round(activity.avgGroundContactTime, 1),
+      strideLengthCm: round(activity.avgStrideLength, 1),
+      verticalRatioPercent: round(activity.avgVerticalRatio, 2),
+    },
+
+    fastestSplitsSeconds: {
+      m1000: round(activity.fastestSplit_1000, 1),
+      mile1609: round(activity.fastestSplit_1609, 1),
+      m5000: round(activity.fastestSplit_5000, 1),
+    },
+
+    hrZonesSeconds: {
+      z1: round(activity.hrTimeInZone_1, 1),
+      z2: round(activity.hrTimeInZone_2, 1),
+      z3: round(activity.hrTimeInZone_3, 1),
+      z4: round(activity.hrTimeInZone_4, 1),
+      z5: round(activity.hrTimeInZone_5, 1),
+    },
+
+    powerZonesSeconds: {
+      z1: round(activity.powerTimeInZone_1, 1),
+      z2: round(activity.powerTimeInZone_2, 1),
+      z3: round(activity.powerTimeInZone_3, 1),
+      z4: round(activity.powerTimeInZone_4, 1),
+      z5: round(activity.powerTimeInZone_5, 1),
+    },
+  };
+}
+
 function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
   const parsed = raw ? Number.parseInt(raw, 10) : fallback;
   if (!Number.isFinite(parsed)) return fallback;
@@ -203,6 +297,23 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
     return json({ activity: data[0] ?? null });
   }
 
+  if (url.pathname === "/v1/runs/latest") {
+    const data = await withGarmin(env, async (client) => {
+      const activities = await client.getActivities(0, 20);
+
+      const run =
+        activities.find(
+          (activity: any) =>
+            activity?.activityType?.typeKey === "running" ||
+            activity?.sportTypeId === 1,
+        ) ?? null;
+
+      return compactRun(run);
+    });
+
+    return json({ run: data });
+  }
+
   const activityMatch = url.pathname.match(/^\/v1\/activities\/(\d+)$/);
   if (activityMatch) {
     const activityId = Number(activityMatch[1]);
@@ -273,7 +384,7 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
 
     const data = await withGarmin(env, async (client) => {
       const results = await Promise.allSettled([
-        client.getActivities(0, 1),
+        client.getActivities(0, 20),
         client.getDailySummary(date),
         client.getSleepData(date),
         client.getHrvSummary(date),
@@ -283,21 +394,45 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
         client.getVo2Max(date, date),
       ]);
 
-      const latestActivities = settled(results[0]);
+      const activitiesResult = settled(results[0]);
+
+      let latestRun: Record<string, unknown> | null | { error: string } = null;
+
+      if (Array.isArray(activitiesResult)) {
+        const rawRun =
+          activitiesResult.find(
+            (activity: any) =>
+              activity?.activityType?.typeKey === "running" ||
+              activity?.sportTypeId === 1,
+          ) ?? null;
+        latestRun = compactRun(rawRun);
+      } else {
+        latestRun = activitiesResult;
+      }
+
       return {
-        latestActivity:
-          Array.isArray(latestActivities) ? latestActivities[0] ?? null : latestActivities,
-        summary: settled(results[1]),
-        sleep: settled(results[2]),
-        hrv: settled(results[3]),
-        bodyBattery: settled(results[4]),
-        trainingReadiness: settled(results[5]),
-        trainingStatus: settled(results[6]),
-        vo2Max: settled(results[7]),
+        latestRun,
+        recovery: {
+          summary: settled(results[1]),
+          sleep: settled(results[2]),
+          hrv: settled(results[3]),
+          bodyBattery: settled(results[4]),
+          trainingReadiness: settled(results[5]),
+          trainingStatus: settled(results[6]),
+          vo2Max: settled(results[7]),
+        },
       };
     });
 
-    return json({ date, ...data });
+    return json({
+      date,
+      privacy: {
+        activityGpsIncluded: false,
+        profileIncluded: false,
+        userRolesIncluded: false,
+      },
+      ...data,
+    });
   }
 
   return json({ error: "Route not found" }, 404);
@@ -318,6 +453,7 @@ function docs(): Response {
       api: [
         "GET /v1/activities?start=0&limit=10",
         "GET /v1/activities/latest",
+        "GET /v1/runs/latest",
         "GET /v1/activities/:id",
         "GET /v1/summary?date=YYYY-MM-DD",
         "GET /v1/sleep?date=YYYY-MM-DD",
