@@ -319,6 +319,96 @@ function compactVo2Max(vo2: any): Record<string, unknown> | { error: string } | 
   };
 }
 
+
+function shiftIsoDate(date: string, deltaDays: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1, day + deltaDays));
+  return shifted.toISOString().slice(0, 10);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function compactRunHistoryItem(activity: any): Record<string, unknown> {
+  const compact = compactRun(activity) as any;
+
+  return {
+    id: compact?.id ?? null,
+    startTimeLocal: compact?.startTimeLocal ?? null,
+    distanceKm: compact?.distanceKm ?? null,
+    durationSeconds: compact?.durationSeconds ?? null,
+    paceSecPerKm: compact?.paceSecPerKm ?? null,
+    avgHr: compact?.avgHr ?? null,
+    maxHr: compact?.maxHr ?? null,
+    avgPowerW: compact?.avgPowerW ?? null,
+    avgCadenceSpm: compact?.avgCadenceSpm ?? null,
+    aerobicTrainingEffect: compact?.aerobicTrainingEffect ?? null,
+    anaerobicTrainingEffect: compact?.anaerobicTrainingEffect ?? null,
+    trainingLoad: compact?.trainingLoad ?? null,
+    vo2Max: compact?.vo2Max ?? null,
+  };
+}
+
+function summarizeRunsForDate(
+  activities: any[],
+  date: string,
+): Record<string, unknown> {
+  const runs = activities.filter((activity: any) => {
+    const isRun =
+      activity?.activityType?.typeKey === "running" ||
+      activity?.sportTypeId === 1;
+
+    const activityDate =
+      typeof activity?.startTimeLocal === "string"
+        ? activity.startTimeLocal.slice(0, 10)
+        : null;
+
+    return isRun && activityDate === date;
+  });
+
+  const items = runs.map(compactRunHistoryItem);
+
+  const numericSum = (field: string): number =>
+    items.reduce((sum: number, item: any) => {
+      const value = item?.[field];
+      return sum + (typeof value === "number" ? value : 0);
+    }, 0);
+
+  const trainingEffects = items
+    .map((item: any) => item?.aerobicTrainingEffect)
+    .filter((value: unknown): value is number => typeof value === "number");
+
+  return {
+    count: items.length,
+    totalDistanceKm: round(numericSum("distanceKm"), 2),
+    totalDurationSeconds: round(numericSum("durationSeconds"), 1),
+    totalTrainingLoad: round(numericSum("trainingLoad"), 1),
+    maxAerobicTrainingEffect:
+      trainingEffects.length > 0 ? round(Math.max(...trainingEffects), 1) : null,
+    items,
+  };
+}
+
+function compactHistoryRecovery(
+  summary: unknown,
+  sleep: unknown,
+  hrv: unknown,
+  readiness: unknown,
+): Record<string, unknown> {
+  const daily = compactDailySummary(summary);
+  const compactedSleep = compactSleep(sleep);
+  const compactedHrv = compactHrv(hrv);
+  const compactedReadiness = compactTrainingReadiness(readiness);
+
+  return {
+    daily,
+    sleep: compactedSleep,
+    hrv: compactedHrv,
+    trainingReadiness: compactedReadiness,
+  };
+}
+
 function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
   const parsed = raw ? Number.parseInt(raw, 10) : fallback;
   if (!Number.isFinite(parsed)) return fallback;
@@ -599,6 +689,97 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
     });
   }
 
+
+  if (url.pathname === "/v1/coach/history") {
+    const endDate = getDate(url, env);
+
+    // Keep one request comfortably below a large first-run Garmin burst.
+    // We can extend to 28 days later using scheduled KV precomputation.
+    const days = clampInt(url.searchParams.get("days"), 7, 1, 10);
+    const startDate = shiftIsoDate(endDate, -(days - 1));
+
+    const result = await withGarmin(env, async (client) => {
+      // One activity request for all days. 100 is intentionally generous for
+      // a 10-day personal history window and avoids per-day activity calls.
+      const activities = await client.getActivities(0, 100);
+
+      const history: Array<Record<string, unknown>> = [];
+      let cachedDays = 0;
+      let fetchedDays = 0;
+
+      for (let offset = days - 1; offset >= 0; offset--) {
+        const date = shiftIsoDate(endDate, -offset);
+        const cacheKey = `coach:history:v1:${date}`;
+
+        let recovery =
+          await env.GARMIN_KV.get<Record<string, unknown>>(cacheKey, "json");
+
+        if (recovery) {
+          cachedDays += 1;
+        } else {
+          fetchedDays += 1;
+
+          // Fetch one day's recovery signals together.
+          const settledResults = await Promise.allSettled([
+            client.getDailySummary(date),
+            client.getSleepData(date),
+            client.getHrvSummary(date),
+            client.getTrainingReadiness(date),
+          ]);
+
+          recovery = compactHistoryRecovery(
+            settled(settledResults[0]),
+            settled(settledResults[1]),
+            settled(settledResults[2]),
+            settled(settledResults[3]),
+          );
+
+          // Today's data changes frequently. Past days are effectively stable
+          // but can still be corrected after a late Garmin sync.
+          const expirationTtl = date === endDate ? 300 : 21600;
+
+          await env.GARMIN_KV.put(cacheKey, JSON.stringify(recovery), {
+            expirationTtl,
+          });
+
+          // Spread Garmin request bursts across days.
+          if (offset > 0) {
+            await delay(700);
+          }
+        }
+
+        history.push({
+          date,
+          runs: summarizeRunsForDate(activities as any[], date),
+          recovery,
+        });
+      }
+
+      return {
+        history,
+        cache: {
+          cachedDays,
+          fetchedDays,
+        },
+      };
+    });
+
+    return json({
+      period: {
+        startDate,
+        endDate,
+        days,
+      },
+      privacy: {
+        activityGpsIncluded: false,
+        profileIncluded: false,
+        userRolesIncluded: false,
+        deviceIdentifiersIncluded: false,
+      },
+      ...result,
+    });
+  }
+
   return json({ error: "Route not found" }, 404);
 }
 
@@ -626,6 +807,7 @@ function docs(): Response {
         "GET /v1/body-battery?date=YYYY-MM-DD",
         "GET /v1/health/today",
         "GET /v1/coach/context",
+        "GET /v1/coach/history?days=7",
       ],
     },
   });
