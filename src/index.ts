@@ -838,6 +838,182 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     return json({ connected: false, deleted: true });
   }
 
+  if (url.pathname === "/admin/workouts/preview" && request.method === "POST") {
+    try {
+      const input = parseRunningWorkoutInput(await request.json());
+      const payload = buildGarminRunningWorkout(input);
+
+      return json({
+        valid: true,
+        workout: {
+          name: input.name,
+          date: input.date ?? null,
+          estimatedDurationSeconds: input.steps.reduce(
+            (sum, step) => sum + step.durationSeconds,
+            0,
+          ),
+          steps: input.steps,
+        },
+        garminPayload: payload,
+      });
+    } catch (error) {
+      return json(
+        {
+          valid: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        400,
+      );
+    }
+  }
+
+  if (url.pathname === "/admin/workouts/create" && request.method === "POST") {
+    try {
+      const input = parseRunningWorkoutInput(await request.json());
+      const payload = buildGarminRunningWorkout(input);
+
+      const created = await withGarmin(env, async (client) =>
+        garminWorkoutWrite(
+          env,
+          client,
+          "/workout-service/workout",
+          "POST",
+          payload,
+        ),
+      );
+
+      const createdRecord =
+        created && typeof created === "object"
+          ? (created as Record<string, unknown>)
+          : {};
+
+      return json({
+        created: true,
+        workoutId: createdRecord.workoutId ?? null,
+        workoutName: createdRecord.workoutName ?? input.name,
+        estimatedDurationSeconds: input.steps.reduce(
+          (sum, step) => sum + step.durationSeconds,
+          0,
+        ),
+      });
+    } catch (error) {
+      return json(
+        {
+          created: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        502,
+      );
+    }
+  }
+
+  if (
+    url.pathname === "/admin/workouts/create-and-schedule" &&
+    request.method === "POST"
+  ) {
+    try {
+      const input = parseRunningWorkoutInput(await request.json());
+
+      if (!input.date) {
+        return json(
+          {
+            created: false,
+            scheduled: false,
+            error: "date is required in YYYY-MM-DD format",
+          },
+          400,
+        );
+      }
+
+      const result = await withGarmin(env, async (client) => {
+        const payload = buildGarminRunningWorkout(input);
+
+        const created = await garminWorkoutWrite(
+          env,
+          client,
+          "/workout-service/workout",
+          "POST",
+          payload,
+        );
+
+        const createdRecord =
+          created && typeof created === "object"
+            ? (created as Record<string, unknown>)
+            : {};
+
+        const workoutId = Number(createdRecord.workoutId);
+
+        if (!Number.isFinite(workoutId) || workoutId <= 0) {
+          throw new Error("Garmin created the workout but did not return a workoutId");
+        }
+
+        try {
+          const schedule = await garminWorkoutWrite(
+            env,
+            client,
+            `/workout-service/schedule/${workoutId}`,
+            "POST",
+            { date: input.date },
+          );
+
+          const scheduleRecord =
+            schedule && typeof schedule === "object"
+              ? (schedule as Record<string, unknown>)
+              : {};
+
+          return {
+            workoutId,
+            scheduled: true,
+            scheduleId:
+              scheduleRecord.workoutScheduleId ??
+              scheduleRecord.id ??
+              null,
+            scheduleError: null,
+          };
+        } catch (scheduleError) {
+          return {
+            workoutId,
+            scheduled: false,
+            scheduleId: null,
+            scheduleError:
+              scheduleError instanceof Error
+                ? scheduleError.message
+                : String(scheduleError),
+          };
+        }
+      });
+
+      return json({
+        created: true,
+        scheduled: result.scheduled,
+        date: input.date,
+        workoutId: result.workoutId,
+        workoutScheduleId: result.scheduleId,
+        workoutName: input.name,
+        estimatedDurationSeconds: input.steps.reduce(
+          (sum, step) => sum + step.durationSeconds,
+          0,
+        ),
+        ...(result.scheduleError
+          ? {
+              warning:
+                `Workout was saved in Garmin Connect but scheduling failed: ${result.scheduleError}`,
+            }
+          : {}),
+      });
+    } catch (error) {
+      return json(
+        {
+          created: false,
+          scheduled: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        502,
+      );
+    }
+  }
+
+
   return json({ error: "Admin route not found" }, 404);
 }
 
@@ -1099,181 +1275,6 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
     });
   }
 
-
-  if (url.pathname === "/admin/workouts/preview" && request.method === "POST") {
-    try {
-      const input = parseRunningWorkoutInput(await request.json());
-      const payload = buildGarminRunningWorkout(input);
-
-      return json({
-        valid: true,
-        workout: {
-          name: input.name,
-          date: input.date ?? null,
-          estimatedDurationSeconds: input.steps.reduce(
-            (sum, step) => sum + step.durationSeconds,
-            0,
-          ),
-          steps: input.steps,
-        },
-        garminPayload: payload,
-      });
-    } catch (error) {
-      return json(
-        {
-          valid: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        400,
-      );
-    }
-  }
-
-  if (url.pathname === "/admin/workouts/create" && request.method === "POST") {
-    try {
-      const input = parseRunningWorkoutInput(await request.json());
-      const payload = buildGarminRunningWorkout(input);
-
-      const created = await withGarmin(env, async (client) =>
-        garminWorkoutWrite(
-          env,
-          client,
-          "/workout-service/workout",
-          "POST",
-          payload,
-        ),
-      );
-
-      const createdRecord =
-        created && typeof created === "object"
-          ? (created as Record<string, unknown>)
-          : {};
-
-      return json({
-        created: true,
-        workoutId: createdRecord.workoutId ?? null,
-        workoutName: createdRecord.workoutName ?? input.name,
-        estimatedDurationSeconds: input.steps.reduce(
-          (sum, step) => sum + step.durationSeconds,
-          0,
-        ),
-      });
-    } catch (error) {
-      return json(
-        {
-          created: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        502,
-      );
-    }
-  }
-
-  if (
-    url.pathname === "/admin/workouts/create-and-schedule" &&
-    request.method === "POST"
-  ) {
-    try {
-      const input = parseRunningWorkoutInput(await request.json());
-
-      if (!input.date) {
-        return json(
-          {
-            created: false,
-            scheduled: false,
-            error: "date is required in YYYY-MM-DD format",
-          },
-          400,
-        );
-      }
-
-      const result = await withGarmin(env, async (client) => {
-        const payload = buildGarminRunningWorkout(input);
-
-        const created = await garminWorkoutWrite(
-          env,
-          client,
-          "/workout-service/workout",
-          "POST",
-          payload,
-        );
-
-        const createdRecord =
-          created && typeof created === "object"
-            ? (created as Record<string, unknown>)
-            : {};
-
-        const workoutId = Number(createdRecord.workoutId);
-
-        if (!Number.isFinite(workoutId) || workoutId <= 0) {
-          throw new Error("Garmin created the workout but did not return a workoutId");
-        }
-
-        try {
-          const schedule = await garminWorkoutWrite(
-            env,
-            client,
-            `/workout-service/schedule/${workoutId}`,
-            "POST",
-            { date: input.date },
-          );
-
-          const scheduleRecord =
-            schedule && typeof schedule === "object"
-              ? (schedule as Record<string, unknown>)
-              : {};
-
-          return {
-            workoutId,
-            scheduled: true,
-            scheduleId:
-              scheduleRecord.workoutScheduleId ??
-              scheduleRecord.id ??
-              null,
-            scheduleError: null,
-          };
-        } catch (scheduleError) {
-          return {
-            workoutId,
-            scheduled: false,
-            scheduleId: null,
-            scheduleError:
-              scheduleError instanceof Error
-                ? scheduleError.message
-                : String(scheduleError),
-          };
-        }
-      });
-
-      return json({
-        created: true,
-        scheduled: result.scheduled,
-        date: input.date,
-        workoutId: result.workoutId,
-        workoutScheduleId: result.scheduleId,
-        workoutName: input.name,
-        estimatedDurationSeconds: input.steps.reduce(
-          (sum, step) => sum + step.durationSeconds,
-          0,
-        ),
-        ...(result.scheduleError
-          ? {
-              warning:
-                `Workout was saved in Garmin Connect but scheduling failed: ${result.scheduleError}`,
-            }
-          : {}),
-      });
-    } catch (error) {
-      return json(
-        {
-          created: false,
-          scheduled: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        502,
-      );
-    }
-  }
 
   return json({ error: "Route not found" }, 404);
 }
