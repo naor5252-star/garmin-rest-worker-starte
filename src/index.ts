@@ -681,7 +681,7 @@ async function garminWorkoutWrite(
   env: Env,
   client: GarminConnectClient,
   path: string,
-  method: "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   body?: unknown,
 ): Promise<unknown> {
   const tokens = client.getTokens();
@@ -724,6 +724,53 @@ async function garminWorkoutWrite(
   } catch {
     return { raw: responseText };
   }
+}
+
+
+type TrackedWorkout = {
+  workoutId: number;
+  workoutScheduleId: number | null;
+  date: string | null;
+  workoutName: string | null;
+  updatedAt: string;
+};
+
+function workoutTrackingKey(workoutId: number): string {
+  return `garmin:workout:${workoutId}`;
+}
+
+async function getTrackedWorkout(
+  env: Env,
+  workoutId: number,
+): Promise<TrackedWorkout | null> {
+  return env.GARMIN_KV.get<TrackedWorkout>(
+    workoutTrackingKey(workoutId),
+    "json",
+  );
+}
+
+async function saveTrackedWorkout(
+  env: Env,
+  value: Omit<TrackedWorkout, "updatedAt">,
+): Promise<void> {
+  await env.GARMIN_KV.put(
+    workoutTrackingKey(value.workoutId),
+    JSON.stringify({ ...value, updatedAt: new Date().toISOString() }),
+  );
+}
+
+function positiveId(value: unknown): number | null {
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number(value)
+        : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+function validIsoDate(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
 function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
@@ -983,6 +1030,14 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
         }
       });
 
+      await saveTrackedWorkout(env, {
+        workoutId: result.workoutId,
+        workoutScheduleId:
+          typeof result.scheduleId === "number" ? result.scheduleId : null,
+        date: result.scheduled ? input.date : null,
+        workoutName: input.name,
+      });
+
       return json({
         created: true,
         scheduled: result.scheduled,
@@ -1013,6 +1068,201 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
     }
   }
 
+
+
+  const rescheduleMatch =
+    url.pathname.match(/^\/admin\/workouts\/(\d+)\/reschedule$/);
+
+  if (rescheduleMatch && request.method === "POST") {
+    const workoutId = Number(rescheduleMatch[1]);
+    const body = (await request.json()) as {
+      date?: unknown;
+      workoutScheduleId?: unknown;
+    };
+
+    if (!validIsoDate(body.date)) {
+      return json({ error: "date must be YYYY-MM-DD" }, 400);
+    }
+
+    const tracked = await getTrackedWorkout(env, workoutId);
+    const scheduleId =
+      positiveId(body.workoutScheduleId) ??
+      positiveId(tracked?.workoutScheduleId ?? null);
+
+    if (!scheduleId) {
+      return json(
+        {
+          error:
+            "workoutScheduleId is required for this older/untracked workout",
+          code: "WORKOUT_SCHEDULE_ID_REQUIRED",
+          workoutId,
+        },
+        409,
+      );
+    }
+
+    const newScheduleId = await withGarmin(env, async (client) => {
+      await garminWorkoutWrite(
+        env,
+        client,
+        `/workout-service/schedule/${scheduleId}`,
+        "DELETE",
+      );
+
+      await saveTrackedWorkout(env, {
+        workoutId,
+        workoutScheduleId: null,
+        date: null,
+        workoutName: tracked?.workoutName ?? null,
+      });
+
+      const response = await garminWorkoutWrite(
+        env,
+        client,
+        `/workout-service/schedule/${workoutId}`,
+        "POST",
+        { date: body.date },
+      );
+
+      const r =
+        response && typeof response === "object"
+          ? (response as Record<string, unknown>)
+          : {};
+
+      const id = positiveId(r.workoutScheduleId ?? r.id);
+      if (!id) {
+        throw new Error(
+          "Garmin rescheduled the workout but returned no workoutScheduleId",
+        );
+      }
+      return id;
+    });
+
+    await saveTrackedWorkout(env, {
+      workoutId,
+      workoutScheduleId: newScheduleId,
+      date: body.date,
+      workoutName: tracked?.workoutName ?? null,
+    });
+
+    return json({
+      rescheduled: true,
+      workoutId,
+      oldWorkoutScheduleId: scheduleId,
+      workoutScheduleId: newScheduleId,
+      date: body.date,
+    });
+  }
+
+  const workoutMatch = url.pathname.match(/^\/admin\/workouts\/(\d+)$/);
+
+  if (workoutMatch) {
+    const workoutId = Number(workoutMatch[1]);
+
+    if (request.method === "GET") {
+      const workout = await withGarmin(env, (client) =>
+        garminWorkoutWrite(
+          env,
+          client,
+          `/workout-service/workout/${workoutId}`,
+          "GET",
+        ),
+      );
+
+      return json({
+        workoutId,
+        tracked: await getTrackedWorkout(env, workoutId),
+        workout,
+      });
+    }
+
+    if (request.method === "PUT") {
+      const input = parseRunningWorkoutInput(await request.json());
+      const payload = {
+        ...buildGarminRunningWorkout(input),
+        workoutId,
+      };
+
+      await withGarmin(env, (client) =>
+        garminWorkoutWrite(
+          env,
+          client,
+          `/workout-service/workout/${workoutId}`,
+          "PUT",
+          payload,
+        ),
+      );
+
+      const tracked = await getTrackedWorkout(env, workoutId);
+
+      await saveTrackedWorkout(env, {
+        workoutId,
+        workoutScheduleId:
+          positiveId(tracked?.workoutScheduleId ?? null),
+        date: tracked?.date ?? null,
+        workoutName: input.name,
+      });
+
+      return json({
+        updated: true,
+        workoutId,
+        workoutName: input.name,
+        estimatedDurationSeconds: input.steps.reduce(
+          (sum, step) => sum + step.durationSeconds,
+          0,
+        ),
+        scheduleUnchanged: true,
+      });
+    }
+
+    if (request.method === "DELETE") {
+      const tracked = await getTrackedWorkout(env, workoutId);
+      const scheduleId =
+        positiveId(url.searchParams.get("workoutScheduleId")) ??
+        positiveId(tracked?.workoutScheduleId ?? null);
+      const force = url.searchParams.get("force") === "true";
+
+      if (!scheduleId && !force) {
+        return json(
+          {
+            error:
+              "No workoutScheduleId is known. Pass ?workoutScheduleId=ID or explicitly use ?force=true.",
+            code: "WORKOUT_SCHEDULE_ID_REQUIRED",
+          },
+          409,
+        );
+      }
+
+      await withGarmin(env, async (client) => {
+        if (scheduleId) {
+          await garminWorkoutWrite(
+            env,
+            client,
+            `/workout-service/schedule/${scheduleId}`,
+            "DELETE",
+          );
+        }
+
+        await garminWorkoutWrite(
+          env,
+          client,
+          `/workout-service/workout/${workoutId}`,
+          "DELETE",
+        );
+      });
+
+      await env.GARMIN_KV.delete(workoutTrackingKey(workoutId));
+
+      return json({
+        deleted: true,
+        workoutId,
+        unscheduled: Boolean(scheduleId),
+        workoutScheduleId: scheduleId,
+      });
+    }
+
+    return json({ error: "Method not allowed" }, 405);
+  }
 
   return json({ error: "Admin route not found" }, 404);
 }
@@ -1290,6 +1540,10 @@ function docs(): Response {
         "POST /admin/workouts/preview",
         "POST /admin/workouts/create",
         "POST /admin/workouts/create-and-schedule",
+        "GET /admin/workouts/:id",
+        "PUT /admin/workouts/:id",
+        "DELETE /admin/workouts/:id?workoutScheduleId=ID",
+        "POST /admin/workouts/:id/reschedule",
         "POST /admin/login",
         "PUT /admin/tokens",
         "DELETE /admin/session",
