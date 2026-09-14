@@ -1267,7 +1267,294 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
   return json({ error: "Admin route not found" }, 404);
 }
 
+
+// GARMIN_MCP_V9_BEGIN
+type McpRequest = {
+  jsonrpc?: string;
+  id?: string | number | null;
+  method?: string;
+  params?: Record<string, unknown>;
+};
+
+const GARMIN_MCP_TOOLS = [
+  {
+    name: "get_coach_history",
+    description: "Read Garmin coach history and recovery trends for the requested number of days.",
+    inputSchema: {
+      type: "object",
+      properties: { days: { type: "integer", minimum: 1, maximum: 31, default: 7 } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_workout",
+    description: "Read one existing Garmin running workout by workoutId before changing it.",
+    inputSchema: {
+      type: "object",
+      properties: { workoutId: { type: "integer", minimum: 1 } },
+      required: ["workoutId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "create_and_schedule_workout",
+    description: "Create and schedule one Garmin running workout. Use only when no matching workout already exists.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1 },
+        description: { type: "string" },
+        date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+        steps: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["warmup", "interval", "recovery", "cooldown"] },
+              durationSeconds: { type: "integer", minimum: 1 },
+              description: { type: "string" },
+            },
+            required: ["type", "durationSeconds"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["name", "date", "steps"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "update_workout",
+    description: "Update the same Garmin workoutId in place. Read it first and preserve its intended schedule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workoutId: { type: "integer", minimum: 1 },
+        name: { type: "string", minLength: 1 },
+        description: { type: "string" },
+        steps: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["warmup", "interval", "recovery", "cooldown"] },
+              durationSeconds: { type: "integer", minimum: 1 },
+              description: { type: "string" },
+            },
+            required: ["type", "durationSeconds"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["workoutId", "name", "steps"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "reschedule_workout",
+    description: "Move an existing workout to a new date. Supply workoutScheduleId whenever it is known.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workoutId: { type: "integer", minimum: 1 },
+        workoutScheduleId: { type: "integer", minimum: 1 },
+        date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+      },
+      required: ["workoutId", "date"],
+      additionalProperties: false,
+    },
+  },
+];
+
+function mcpJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "mcp-protocol-version": "2025-03-26",
+    },
+  });
+}
+
+function mcpResult(id: McpRequest["id"], value: unknown, isError = false): Response {
+  return mcpJson({
+    jsonrpc: "2.0",
+    id: id ?? null,
+    result: {
+      content: [{ type: "text", text: JSON.stringify(value) }],
+      structuredContent: typeof value === "object" && value !== null ? value : { value },
+      isError,
+    },
+  });
+}
+
+function mcpError(id: McpRequest["id"], code: number, message: string, status = 200): Response {
+  return mcpJson({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }, status);
+}
+
+function mcpBearer(request: Request): string {
+  const value = request.headers.get("authorization") || "";
+  return value.startsWith("Bearer ") ? value.slice(7).trim() : "";
+}
+
+function mcpPositiveInt(value: unknown, name: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+  return parsed;
+}
+
+function mcpIsoDate(value: unknown): string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error("date must use YYYY-MM-DD");
+  }
+  return value;
+}
+
+async function mcpDelegate(response: Response): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const text = await response.text();
+  let data: unknown = text;
+  try { data = text ? JSON.parse(text) : null; } catch (_) {}
+  return { ok: response.ok, status: response.status, data };
+}
+
+async function mcpCallTool(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const origin = "https://garmin-mcp.internal";
+  if (name === "get_coach_history") {
+    const days = Math.max(1, Math.min(31, Number(args.days ?? 7) || 7));
+    const request = new Request(`${origin}/v1/coach/history?days=${days}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${env.API_TOKEN}` },
+    });
+    return mcpDelegate(await handleV1(request, env, new URL(request.url)));
+  }
+
+  if (name === "get_workout") {
+    const workoutId = mcpPositiveInt(args.workoutId, "workoutId");
+    const request = new Request(`${origin}/admin/workouts/${workoutId}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${env.ADMIN_TOKEN}` },
+    });
+    return mcpDelegate(await handleAdmin(request, env, new URL(request.url)));
+  }
+
+  if (name === "create_and_schedule_workout") {
+    const body = {
+      name: args.name,
+      description: args.description,
+      date: mcpIsoDate(args.date),
+      steps: args.steps,
+    };
+    const request = new Request(`${origin}/admin/workouts/create-and-schedule`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return mcpDelegate(await handleAdmin(request, env, new URL(request.url)));
+  }
+
+  if (name === "update_workout") {
+    const workoutId = mcpPositiveInt(args.workoutId, "workoutId");
+    const body = { name: args.name, description: args.description, steps: args.steps };
+    const request = new Request(`${origin}/admin/workouts/${workoutId}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return mcpDelegate(await handleAdmin(request, env, new URL(request.url)));
+  }
+
+  if (name === "reschedule_workout") {
+    const workoutId = mcpPositiveInt(args.workoutId, "workoutId");
+    const body: Record<string, unknown> = { date: mcpIsoDate(args.date) };
+    if (args.workoutScheduleId !== undefined) {
+      body.workoutScheduleId = mcpPositiveInt(args.workoutScheduleId, "workoutScheduleId");
+    }
+    const request = new Request(`${origin}/admin/workouts/${workoutId}/reschedule`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return mcpDelegate(await handleAdmin(request, env, new URL(request.url)));
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+async function handleGarminMcp(request: Request, env: Env): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-headers": "authorization, content-type, mcp-protocol-version",
+        "access-control-allow-methods": "POST, OPTIONS",
+      },
+    });
+  }
+  if (request.method !== "POST") return mcpJson({ error: "Method not allowed" }, 405);
+  if (!env.ADMIN_TOKEN || mcpBearer(request) !== env.ADMIN_TOKEN) {
+    return mcpJson({ error: "Unauthorized" }, 401);
+  }
+
+  let rpc: McpRequest;
+  try { rpc = await request.json<McpRequest>(); }
+  catch (_) { return mcpError(null, -32700, "Parse error", 400); }
+
+  if (rpc.jsonrpc !== "2.0" || !rpc.method) return mcpError(rpc.id, -32600, "Invalid Request", 400);
+
+  if (rpc.method === "notifications/initialized") return new Response(null, { status: 204 });
+  if (rpc.method === "ping") return mcpJson({ jsonrpc: "2.0", id: rpc.id ?? null, result: {} });
+  if (rpc.method === "initialize") {
+    return mcpJson({
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "garmin-running-coach", version: "1.0.0" },
+      },
+    });
+  }
+  if (rpc.method === "tools/list") {
+    return mcpJson({ jsonrpc: "2.0", id: rpc.id ?? null, result: { tools: GARMIN_MCP_TOOLS } });
+  }
+  if (rpc.method === "tools/call") {
+    const params = (rpc.params || {}) as { name?: unknown; arguments?: unknown };
+    if (typeof params.name !== "string") return mcpError(rpc.id, -32602, "Tool name is required");
+    const args = params.arguments && typeof params.arguments === "object"
+      ? params.arguments as Record<string, unknown>
+      : {};
+    try {
+      const result = await mcpCallTool(params.name, args, env);
+      return mcpResult(rpc.id, { status: result.status, data: result.data }, !result.ok);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return mcpResult(rpc.id, { error: message }, true);
+    }
+  }
+  return mcpError(rpc.id, -32601, "Method not found");
+}
+// GARMIN_MCP_V9_END
+
 async function handleV1(request: Request, env: Env, url: URL): Promise<Response> {
+  // GARMIN_MCP_V9_ROUTE
+  if (url.pathname === "/v1/mcp") return handleGarminMcp(request, env);
   if (!isAuthorized(request, env.API_TOKEN)) {
     return json({ error: "Unauthorized" }, 401);
   }
