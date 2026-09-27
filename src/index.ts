@@ -1620,6 +1620,7 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
     const timezone = env.TIMEZONE || "UTC";
     const startDate = url.searchParams.get("start") || todayInTimezone(timezone);
     const endDate = url.searchParams.get("end") || shiftIsoDate(startDate, 13);
+    const debug = url.searchParams.get("debug") === "1";
 
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
       return json({ error: "start/end must use YYYY-MM-DD" }, 400);
@@ -1632,7 +1633,7 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
       return json({ error: "Scheduled workout range must be 0-62 days" }, 400);
     }
 
-    const workouts = await withGarmin(env, async (client) => {
+    const result = await withGarmin(env, async (client) => {
       const months: Array<{ year: number; month: number }> = [];
       const cursor = new Date(`${startDate}T12:00:00Z`);
       cursor.setUTCDate(1);
@@ -1644,6 +1645,46 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
       }
 
       const rows: Array<Record<string, unknown>> = [];
+      const diagnostics: Array<Record<string, unknown>> = [];
+
+      const positiveDeep = (root: any, keys: string[]): number | null => {
+        const queue = [root];
+        const seen = new Set<any>();
+        const wanted = new Set(keys.map((k) => k.toLowerCase()));
+        while (queue.length) {
+          const value = queue.shift();
+          if (!value || typeof value !== "object" || seen.has(value)) continue;
+          seen.add(value);
+          if (Array.isArray(value)) { queue.push(...value); continue; }
+          for (const [key, child] of Object.entries(value)) {
+            if (wanted.has(key.toLowerCase())) {
+              const id = positiveId(child);
+              if (id) return id;
+            }
+            if (child && typeof child === "object") queue.push(child);
+          }
+        }
+        return null;
+      };
+
+      const stringDeep = (root: any, keys: string[]): string | null => {
+        const queue = [root];
+        const seen = new Set<any>();
+        const wanted = new Set(keys.map((k) => k.toLowerCase()));
+        while (queue.length) {
+          const value = queue.shift();
+          if (!value || typeof value !== "object" || seen.has(value)) continue;
+          seen.add(value);
+          if (Array.isArray(value)) { queue.push(...value); continue; }
+          for (const [key, child] of Object.entries(value)) {
+            if (wanted.has(key.toLowerCase()) && typeof child === "string" && child.trim()) {
+              return child.trim();
+            }
+            if (child && typeof child === "object") queue.push(child);
+          }
+        }
+        return null;
+      };
 
       for (const { year, month } of months) {
         const calendar = await garminWorkoutWrite(
@@ -1653,51 +1694,105 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
           "GET",
         ) as any;
 
-        const items = Array.isArray(calendar?.calendarItems)
-          ? calendar.calendarItems
-          : [];
+        const items =
+          Array.isArray(calendar?.calendarItems) ? calendar.calendarItems :
+          Array.isArray(calendar?.items) ? calendar.items :
+          Array.isArray(calendar?.calendarItemList) ? calendar.calendarItemList :
+          Array.isArray(calendar?.data) ? calendar.data :
+          Array.isArray(calendar) ? calendar : [];
 
+        const typeCounts: Record<string, number> = {};
         for (const item of items) {
-          const workoutId = positiveId(item?.workout?.workoutId ?? item?.workoutId);
-          if (!workoutId) continue;
+          const itemType = String(
+            item?.itemType ?? item?.calendarItemType ?? item?.type ?? "",
+          ).toLowerCase();
+          const typeKey = itemType || "(empty)";
+          typeCounts[typeKey] = (typeCounts[typeKey] || 0) + 1;
 
-          const itemType = String(item?.itemType ?? item?.type ?? "").toLowerCase();
-          if (itemType && itemType !== "workout") continue;
+          const workoutId = positiveDeep(item, ["workoutId"]);
+          const scheduleId =
+            positiveId(item?.workoutScheduleId ?? item?.scheduleId ?? item?.id) ??
+            positiveDeep(item, ["workoutScheduleId", "scheduleId"]);
 
           const date = String(
-            item?.date ?? item?.calendarDate ?? item?.startDate ?? "",
+            item?.date ??
+            item?.calendarDate ??
+            item?.startDate ??
+            item?.scheduledDate ??
+            stringDeep(item, ["date", "calendarDate", "scheduledDate"]) ??
+            "",
           ).slice(0, 10);
-          if (!validIsoDate(date) || date < startDate || date > endDate) continue;
 
-          const nested = item?.workout ?? {};
-          const scheduleId = positiveId(
-            item?.workoutScheduleId ?? item?.scheduleId ?? item?.id,
-          );
+          const title = String(
+            item?.title ??
+            item?.workoutName ??
+            item?.name ??
+            item?.workout?.workoutName ??
+            stringDeep(item, ["workoutName", "title"]) ??
+            "Garmin Workout",
+          ).trim();
+
+          const looksLikeWorkout =
+            itemType.includes("workout") ||
+            !!workoutId ||
+            !!item?.workout ||
+            /workout/i.test(String(item?.type ?? ""));
+
+          if (!looksLikeWorkout) continue;
+          if (!validIsoDate(date) || date < startDate || date > endDate) continue;
+          if (!workoutId && !scheduleId) continue;
 
           rows.push({
             workoutId,
             workoutScheduleId: scheduleId,
             scheduleId,
+            calendarItemId: positiveId(item?.id) ?? scheduleId,
             date,
-            name: String(
-              nested?.workoutName ?? item?.workoutName ?? item?.title ?? "Garmin Workout",
-            ),
-            description: nested?.description ?? item?.description ?? null,
+            name: title,
+            description:
+              item?.description ??
+              item?.workout?.description ??
+              stringDeep(item, ["description"]) ??
+              null,
             sportType:
-              nested?.sportType?.sportTypeKey ??
-              item?.sportType?.sportTypeKey ??
               item?.sportTypeKey ??
+              item?.sportType?.sportTypeKey ??
+              item?.workout?.sportType?.sportTypeKey ??
+              stringDeep(item, ["sportTypeKey"]) ??
               null,
             estimatedDurationSeconds:
-              nested?.estimatedDurationInSecs ??
               item?.estimatedDurationInSecs ??
+              item?.workout?.estimatedDurationInSecs ??
               null,
             estimatedDistanceMeters:
-              nested?.estimatedDistanceInMeters ??
               item?.estimatedDistanceInMeters ??
+              item?.workout?.estimatedDistanceInMeters ??
               null,
           });
         }
+
+        diagnostics.push({
+          year,
+          month,
+          arraySource:
+            Array.isArray(calendar?.calendarItems) ? "calendarItems" :
+            Array.isArray(calendar?.items) ? "items" :
+            Array.isArray(calendar?.calendarItemList) ? "calendarItemList" :
+            Array.isArray(calendar?.data) ? "data" :
+            Array.isArray(calendar) ? "root-array" : "none",
+          totalItems: items.length,
+          typeCounts,
+          // Safe structural samples only: no profile, tokens or raw payload.
+          samples: debug ? items.slice(0, 8).map((item: any) => ({
+            keys: Object.keys(item || {}).sort(),
+            itemType: item?.itemType ?? item?.calendarItemType ?? item?.type ?? null,
+            date: item?.date ?? item?.calendarDate ?? item?.startDate ?? null,
+            title: item?.title ?? item?.workoutName ?? item?.name ?? null,
+            id: item?.id ?? null,
+            workoutId: item?.workoutId ?? item?.workout?.workoutId ?? null,
+            workoutScheduleId: item?.workoutScheduleId ?? item?.scheduleId ?? null,
+          })) : undefined,
+        });
       }
 
       const dedupe = new Map<string, Record<string, unknown>>();
@@ -1705,15 +1800,21 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
         const key = `${row.workoutScheduleId ?? row.workoutId}|${row.date}`;
         dedupe.set(key, row);
       }
-      return [...dedupe.values()].sort((a, b) =>
-        String(a.date).localeCompare(String(b.date)),
-      );
+
+      return {
+        workouts: [...dedupe.values()].sort((a, b) =>
+          String(a.date).localeCompare(String(b.date)),
+        ),
+        diagnostics,
+      };
     });
 
     return json({
       period: { startDate, endDate },
-      source: "garmin-calendar-service",
-      workouts,
+      source: "garmin-calendar-service-v2",
+      workoutCount: result.workouts.length,
+      workouts: result.workouts,
+      ...(debug ? { diagnostics: result.diagnostics } : {}),
     });
   }
 
