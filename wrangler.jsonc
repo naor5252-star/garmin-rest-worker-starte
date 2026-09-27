@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "garmin-rest-worker",
+  "name": "garmin-rest-worker-starte",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-04",
   "compatibility_flags": ["nodejs_compat"],
