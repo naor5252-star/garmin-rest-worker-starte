@@ -715,9 +715,7 @@ async function garminWorkoutWrite(
     );
   }
 
-  await env.GARMIN_KV.put("garmin:tokens", JSON.stringify(tokens));
-
-  if (!responseText) return null;
+  // Token persistence is handled once by withGarmin().\n\n  if (!responseText) return null;
 
   try {
     return JSON.parse(responseText);
@@ -779,6 +777,11 @@ function clampInt(raw: string | null, fallback: number, min: number, max: number
   return Math.min(max, Math.max(min, parsed));
 }
 
+function isKvPutQuotaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("KV put() limit exceeded");
+}
+
 async function loadClient(env: Env): Promise<GarminConnectClient> {
   const stored = await env.GARMIN_KV.get<GarminTokens>(TOKEN_KEY, "json");
   if (!stored) {
@@ -787,19 +790,33 @@ async function loadClient(env: Env): Promise<GarminConnectClient> {
     );
   }
 
-  const client = await GarminConnectClient.fromTokens(
+  return GarminConnectClient.fromTokens(
     stored,
     "garmin.com",
     cfFetch,
   );
-  await persistTokens(env, client);
-  return client;
 }
 
-async function persistTokens(env: Env, client: GarminConnectClient): Promise<void> {
+async function persistTokens(
+  env: Env,
+  client: GarminConnectClient,
+  bestEffort = false,
+): Promise<void> {
   const tokens = client.getTokens();
-  if (tokens) {
-    await env.GARMIN_KV.put(TOKEN_KEY, JSON.stringify(tokens));
+  if (!tokens) return;
+
+  const next = JSON.stringify(tokens);
+  const current = await env.GARMIN_KV.get(TOKEN_KEY);
+  if (current === next) return;
+
+  try {
+    await env.GARMIN_KV.put(TOKEN_KEY, next);
+  } catch (error) {
+    if (bestEffort && isKvPutQuotaError(error)) {
+      console.warn("Skipping Garmin token KV write: daily KV write quota exceeded");
+      return;
+    }
+    throw error;
   }
 }
 
@@ -811,7 +828,7 @@ async function withGarmin<T>(
   try {
     return await fn(client);
   } finally {
-    await persistTokens(env, client);
+    await persistTokens(env, client, true);
   }
 }
 
@@ -1599,6 +1616,107 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
     return json({ activityId, detail: data });
   }
 
+  if (url.pathname === "/v1/workouts/scheduled") {
+    const timezone = env.TIMEZONE || "UTC";
+    const startDate = url.searchParams.get("start") || todayInTimezone(timezone);
+    const endDate = url.searchParams.get("end") || shiftIsoDate(startDate, 13);
+
+    if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
+      return json({ error: "start/end must use YYYY-MM-DD" }, 400);
+    }
+
+    const startMs = Date.parse(`${startDate}T00:00:00Z`);
+    const endMs = Date.parse(`${endDate}T00:00:00Z`);
+    const spanDays = Math.round((endMs - startMs) / 86400000);
+    if (!Number.isFinite(spanDays) || spanDays < 0 || spanDays > 62) {
+      return json({ error: "Scheduled workout range must be 0-62 days" }, 400);
+    }
+
+    const workouts = await withGarmin(env, async (client) => {
+      const months: Array<{ year: number; month: number }> = [];
+      const cursor = new Date(`${startDate}T12:00:00Z`);
+      cursor.setUTCDate(1);
+      const endCursor = new Date(`${endDate}T12:00:00Z`);
+
+      while (cursor <= endCursor) {
+        months.push({ year: cursor.getUTCFullYear(), month: cursor.getUTCMonth() });
+        cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+      }
+
+      const rows: Array<Record<string, unknown>> = [];
+
+      for (const { year, month } of months) {
+        const calendar = await garminWorkoutWrite(
+          env,
+          client,
+          `/calendar-service/year/${year}/month/${month}`,
+          "GET",
+        ) as any;
+
+        const items = Array.isArray(calendar?.calendarItems)
+          ? calendar.calendarItems
+          : [];
+
+        for (const item of items) {
+          const workoutId = positiveId(item?.workout?.workoutId ?? item?.workoutId);
+          if (!workoutId) continue;
+
+          const itemType = String(item?.itemType ?? item?.type ?? "").toLowerCase();
+          if (itemType && itemType !== "workout") continue;
+
+          const date = String(
+            item?.date ?? item?.calendarDate ?? item?.startDate ?? "",
+          ).slice(0, 10);
+          if (!validIsoDate(date) || date < startDate || date > endDate) continue;
+
+          const nested = item?.workout ?? {};
+          const scheduleId = positiveId(
+            item?.workoutScheduleId ?? item?.scheduleId ?? item?.id,
+          );
+
+          rows.push({
+            workoutId,
+            workoutScheduleId: scheduleId,
+            scheduleId,
+            date,
+            name: String(
+              nested?.workoutName ?? item?.workoutName ?? item?.title ?? "Garmin Workout",
+            ),
+            description: nested?.description ?? item?.description ?? null,
+            sportType:
+              nested?.sportType?.sportTypeKey ??
+              item?.sportType?.sportTypeKey ??
+              item?.sportTypeKey ??
+              null,
+            estimatedDurationSeconds:
+              nested?.estimatedDurationInSecs ??
+              item?.estimatedDurationInSecs ??
+              null,
+            estimatedDistanceMeters:
+              nested?.estimatedDistanceInMeters ??
+              item?.estimatedDistanceInMeters ??
+              null,
+          });
+        }
+      }
+
+      const dedupe = new Map<string, Record<string, unknown>>();
+      for (const row of rows) {
+        const key = `${row.workoutScheduleId ?? row.workoutId}|${row.date}`;
+        dedupe.set(key, row);
+      }
+      return [...dedupe.values()].sort((a, b) =>
+        String(a.date).localeCompare(String(b.date)),
+      );
+    });
+
+    return json({
+      period: { startDate, endDate },
+      source: "garmin-calendar-service",
+      workouts,
+    });
+  }
+
   if (url.pathname === "/v1/summary") {
     const date = getDate(url, env);
     const data = await withGarmin(env, (client) => client.getDailySummary(date));
@@ -1764,13 +1882,24 @@ async function handleV1(request: Request, env: Env, url: URL): Promise<Response>
             settled(settledResults[3]),
           );
 
-          // Today's data changes frequently. Past days are effectively stable
-          // but can still be corrected after a late Garmin sync.
-          const expirationTtl = date === endDate ? 300 : 21600;
-
-          await env.GARMIN_KV.put(cacheKey, JSON.stringify(recovery), {
-            expirationTtl,
-          });
+          // Do not spend KV writes on today's rapidly-changing recovery data.
+          // Historical cache is opportunistic; KV quota exhaustion must not
+          // make coach history unavailable.
+          if (date !== endDate) {
+            try {
+              await env.GARMIN_KV.put(cacheKey, JSON.stringify(recovery), {
+                expirationTtl: 86400,
+              });
+            } catch (error) {
+              if (isKvPutQuotaError(error)) {
+                console.warn(
+                  `Skipping coach history cache write for ${date}: daily KV write quota exceeded`,
+                );
+              } else {
+                throw error;
+              }
+            }
+          }
 
           // Spread Garmin request bursts across days.
           if (offset > 0) {
@@ -1839,7 +1968,7 @@ function docs(): Response {
         "GET /v1/activities?start=0&limit=10",
         "GET /v1/activities/latest",
         "GET /v1/runs/latest",
-        "GET /v1/activities/:id",
+        "GET /v1/activities/:id",\n        "GET /v1/workouts/scheduled?start=YYYY-MM-DD&end=YYYY-MM-DD",
         "GET /v1/summary?date=YYYY-MM-DD",
         "GET /v1/sleep?date=YYYY-MM-DD",
         "GET /v1/hrv?date=YYYY-MM-DD",
